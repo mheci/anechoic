@@ -1,0 +1,19 @@
+Anechoic Noise Suppression
+Copyright (C) 2026 mheci
+
+This program is derived from noise-suppression-for-voice
+  https://github.com/werman/noise-suppression-for-voice
+  Copyright (C) 2018-2024 werman and contributors
+
+DSP core:
+  RNNoise, Copyright (C) Xiph.Org / Mozilla
+  Licensed under the BSD 3-Clause License
+  https://github.com/xiph/rnnoise
+
+Plugin framework:
+  JUCE, GPL-3.0, https://github.com/juce-framework/JUCE
+  FST (VST2 headers), GPL, https://git.iem.at/cm/fst
+  ladspa++, Copyright (C) 2014-2018 Johannes Lorenz, GPL-3.0
+  Catch2, Boost Software License 1.0
+
+Retrained weights derived from this repository inherit the GPL-3.0.

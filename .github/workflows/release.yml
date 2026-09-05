@@ -1,0 +1,209 @@
+name: Create Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag for the release (e.g. 2.0.0)'
+        required: true
+        default: '2.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        config:
+          - {
+            name: "Windows MSVC",
+            os: windows-2022,
+            build_params: "--parallel --config Release",
+            artifact: "win-anechoic"
+          }
+          - {
+            name: "Ubuntu GCC",
+            os: ubuntu-24.04,
+            build_params: "--parallel",
+            artifact: "linux-anechoic"
+          }
+          - {
+            name: "macOS Clang",
+            os: macos-14,
+            build_params: "--parallel",
+            artifact: "macos-anechoic"
+          }
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux dependencies
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+              libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxinerama-dev libxrandr-dev libxrender-dev \
+              libfreetype-dev libfontconfig1-dev
+
+      - name: Configure (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        run: >-
+          cmake -Bbuild -DBUILD_FOR_RELEASE=1 -DBUILD_VERSION=${{ inputs.tag }}
+          -DBUILD_VST_PLUGIN=1
+          -DBUILD_VST3_PLUGIN=1
+          -DBUILD_LADSPA_PLUGIN=0
+          -DBUILD_LV2_PLUGIN=0
+          -DBUILD_AU_PLUGIN=0
+          -DBUILD_AUV3_PLUGIN=0
+          -DBUILD_OFFLINE_TOOL=1
+
+      - name: Configure (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        run: >-
+          cmake -Bbuild -DCMAKE_BUILD_TYPE=Release -DBUILD_FOR_RELEASE=1 -DBUILD_VERSION=${{ inputs.tag }}
+          -DBUILD_VST_PLUGIN=0
+          -DBUILD_VST3_PLUGIN=1
+          -DBUILD_LADSPA_PLUGIN=1
+          -DBUILD_LV2_PLUGIN=1
+          -DBUILD_AU_PLUGIN=0
+          -DBUILD_AUV3_PLUGIN=0
+          -DBUILD_OFFLINE_TOOL=1
+
+      - name: Configure (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        env:
+          CMAKE_OSX_ARCHITECTURES: "x86_64;arm64"
+        run: >-
+          cmake -Bbuild -DCMAKE_BUILD_TYPE=Release -DBUILD_FOR_RELEASE=1 -DBUILD_VERSION=${{ inputs.tag }}
+          -DBUILD_VST_PLUGIN=1
+          -DBUILD_VST3_PLUGIN=1
+          -DBUILD_LADSPA_PLUGIN=0
+          -DBUILD_LV2_PLUGIN=0
+          -DBUILD_AU_PLUGIN=0
+          -DBUILD_AUV3_PLUGIN=1
+          -DBUILD_OFFLINE_TOOL=1
+
+      - name: Build
+        run: cmake --build build ${{ matrix.config.build_params }}
+
+      - name: Run tests (Unix)
+        if: ${{ runner.os != 'Windows' }}
+        working-directory: build/src/common
+        run: ctest --output-on-failure
+
+      - name: Run tests (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        working-directory: build/src/common
+        run: ctest -C Release --output-on-failure
+
+      - name: Assemble release (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/release/vst
+          cp build/bin/vst/*.dll build/release/vst/ || true
+          if [ -d build/bin/anechoic.vst3 ]; then cp -R build/bin/anechoic.vst3 build/release/; fi
+          find build -maxdepth 6 -type d -name 'anechoic.vst3' -exec cp -R {} build/release/ \;
+          cp build/bin/anechoic_offline.exe build/release/ 2>/dev/null || \
+            find build -name 'anechoic_offline.exe' -exec cp {} build/release/ \;
+          cp release/README-Windows.txt build/release/
+          ls -laR build/release
+
+      - name: Assemble release (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          set -euo pipefail
+          mkdir -p build/release/ladspa
+          cp build/bin/ladspa/libanechoic_ladspa.so build/release/ladspa/
+          cp pipewire/99-anechoic-ladspa.conf build/release/
+          cp pipewire/install-preset.sh build/release/
+          chmod +x build/release/install-preset.sh
+          # LV2 and VST3 for DAWs
+          if [ -d build/bin/anechoic_mono.lv2 ]; then cp -R build/bin/anechoic_mono.lv2 build/release/; fi
+          if [ -d build/bin/anechoic_stereo.lv2 ]; then cp -R build/bin/anechoic_stereo.lv2 build/release/; fi
+          if [ -d build/bin/anechoic.vst3 ]; then cp -R build/bin/anechoic.vst3 build/release/; fi
+          if [ -x build/bin/anechoic_offline ]; then cp build/bin/anechoic_offline build/release/; fi
+          cp release/README-Linux.txt build/release/
+          ls -laR build/release
+
+      - name: Assemble release (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          set -euo pipefail
+          mkdir -p build/release/vst
+          if [ -d build/bin/anechoic.vst3 ]; then cp -R build/bin/anechoic.vst3 build/release/; fi
+          find build -type d -name 'anechoic.vst3' | head -1 | while read -r d; do cp -R "$d" build/release/; done
+          find build -type d -name '*.appex' | while read -r d; do cp -R "$d" build/release/; done
+          if [ -d build/bin/vst ]; then cp -R build/bin/vst/. build/release/vst/ || true; fi
+          if [ -x build/bin/anechoic_offline ]; then cp build/bin/anechoic_offline build/release/; fi
+          find build -type f -name 'anechoic_offline' -perm +111 -exec cp {} build/release/ \; || true
+          cp release/README-macOS.txt build/release/
+          ls -laR build/release
+          test -e build/release/README-macOS.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.config.artifact }}
+          path: build/release
+          retention-days: 5
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: false
+
+      - name: Zip
+        run: |
+          set -euo pipefail
+          ls -laR artifacts
+          cd artifacts
+          mv win-anechoic ../win-anechoic && cd .. && zip -r win-anechoic.zip win-anechoic
+          cd artifacts && mv linux-anechoic ../linux-anechoic && cd .. && zip -r linux-anechoic.zip linux-anechoic
+          cd artifacts && mv macos-anechoic ../macos-anechoic && cd .. && zip -r macos-anechoic.zip macos-anechoic
+          ls -lh *.zip
+
+      - name: Release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: false
+          prerelease: false
+          make_latest: true
+          tag_name: v${{ inputs.tag }}
+          name: Anechoic ${{ inputs.tag }}
+          files: |
+            win-anechoic.zip
+            linux-anechoic.zip
+            macos-anechoic.zip
+          body: |
+            First stable release of Anechoic, a real-time microphone noise suppressor based on Xiph RNNoise.
+
+            ## Downloads
+            - **Windows** (`win-anechoic.zip`) — VST2 (Equalizer APO) and VST3
+            - **Linux** (`linux-anechoic.zip`) — LADSPA + PipeWire preset, LV2, VST3
+            - **macOS** (`macos-anechoic.zip`) — universal AUv3 + VST3
+
+            Set the microphone to **48000 Hz**. Nothing else works.
+
+            ## Defaults
+            VAD threshold 55%, grace 200 ms, hysteresis 0%, comfort floor −40 dB.
+
+            ## Highlights
+            - Shared stereo gate with hysteresis, residual comfort floor and de-click envelope
+            - Live VAD meter in the plugin UI
+            - PipeWire 1.6.3 preset and installer
+            - `anechoic_offline` for batch processing
+            - Derived from [werman/noise-suppression-for-voice](https://github.com/werman/noise-suppression-for-voice); see NOTICE
+
+            Full setup: https://github.com/mheci/anechoic#install

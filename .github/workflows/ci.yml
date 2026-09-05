@@ -1,0 +1,198 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - develop
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - {
+            name: "Windows MSVC (VST2 + VST3)",
+            os: windows-2022,
+            build_params: "--config Release",
+            artifact: "win-anechoic"
+          }
+          - {
+            name: "Ubuntu GCC (LADSPA + LV2)",
+            os: ubuntu-24.04,
+            build_params: "",
+            artifact: "linux-anechoic"
+          }
+          - {
+            name: "macOS Clang (AUv3 + VST3)",
+            os: macos-14,
+            build_params: "",
+            artifact: "macos-anechoic"
+          }
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux dependencies
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+              libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxinerama-dev libxrandr-dev libxrender-dev \
+              libfreetype-dev libfontconfig1-dev \
+              lilv-utils
+
+      - name: Configure (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        run: >-
+          cmake -Bbuild
+          -DBUILD_VST_PLUGIN=1
+          -DBUILD_VST3_PLUGIN=1
+          -DBUILD_LADSPA_PLUGIN=0
+          -DBUILD_LV2_PLUGIN=0
+          -DBUILD_AU_PLUGIN=0
+          -DBUILD_AUV3_PLUGIN=0
+          -DBUILD_OFFLINE_TOOL=1
+
+      - name: Configure (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        run: >-
+          cmake -Bbuild -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_VST_PLUGIN=0
+          -DBUILD_VST3_PLUGIN=1
+          -DBUILD_LADSPA_PLUGIN=1
+          -DBUILD_LV2_PLUGIN=1
+          -DBUILD_AU_PLUGIN=0
+          -DBUILD_AUV3_PLUGIN=0
+          -DBUILD_OFFLINE_TOOL=1
+
+      - name: Configure (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        env:
+          CMAKE_OSX_ARCHITECTURES: "x86_64;arm64"
+        run: >-
+          cmake -Bbuild -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_VST_PLUGIN=1
+          -DBUILD_VST3_PLUGIN=1
+          -DBUILD_LADSPA_PLUGIN=0
+          -DBUILD_LV2_PLUGIN=0
+          -DBUILD_AU_PLUGIN=0
+          -DBUILD_AUV3_PLUGIN=1
+          -DBUILD_OFFLINE_TOOL=1
+
+      - name: Build
+        run: cmake --build build ${{ matrix.config.build_params }} --parallel
+
+      - name: Run tests (Unix)
+        if: ${{ runner.os != 'Windows' }}
+        working-directory: build/src/common
+        run: ctest --output-on-failure
+
+      - name: Run tests (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        working-directory: build/src/common
+        run: ctest -C Release --output-on-failure
+
+      - name: Analyse LADSPA plugin descriptor
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          python3 - <<'PY'
+          import ctypes
+
+          class Descriptor(ctypes.Structure):
+              _fields_ = [('UniqueID', ctypes.c_ulong), ('Label', ctypes.c_char_p),
+                          ('Properties', ctypes.c_ulong), ('Name', ctypes.c_char_p),
+                          ('Maker', ctypes.c_char_p), ('Copyright', ctypes.c_char_p),
+                          ('PortCount', ctypes.c_ulong), ('PortDescriptors', ctypes.c_void_p),
+                          ('PortNames', ctypes.c_void_p), ('PortRanges', ctypes.c_void_p),
+                          ('PortScaleHints', ctypes.c_void_p), ('ImplementationData', ctypes.c_void_p)]
+
+          lib = ctypes.CDLL('build/bin/ladspa/libanechoic_ladspa.so')
+          lib.ladspa_descriptor.argtypes = [ctypes.c_ulong]
+          lib.ladspa_descriptor.restype = ctypes.POINTER(Descriptor)
+          labels = []
+          for i in range(64):
+              p = lib.ladspa_descriptor(i)
+              if not p:
+                  break
+              d = p.contents
+              assert d.Label and d.Name and d.Maker
+              labels.append(d.Label.decode())
+              print('index', i, 'label', labels[-1], 'id', d.UniqueID, 'ports', d.PortCount)
+          assert labels == ['noise_suppressor_mono', 'noise_suppressor_stereo'], labels
+          ids = [lib.ladspa_descriptor(i).contents.UniqueID for i in range(len(labels))]
+          assert ids[0] != ids[1], ids
+          print('LADSPA mono+stereo descriptors OK')
+          PY
+
+      - name: Check LADSPA shared object dependencies
+        if: ${{ runner.os == 'Linux' }}
+        run: ldd build/bin/ladspa/libanechoic_ladspa.so
+
+      - name: Smoke-test anechoic_offline
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          python3 - <<'PY'
+          import math, struct, wave
+          with wave.open('/tmp/test.wav', 'wb') as w:
+              w.setnchannels(1); w.setsampwidth(2); w.setframerate(48000)
+              w.writeframes(b''.join(struct.pack('<h', int(8000*math.sin(i/12))) for i in range(24000)))
+          PY
+          build/bin/anechoic_offline /tmp/test.wav /tmp/out.wav --threshold 0.5 --comfort-db -90
+          python3 - <<'PY'
+          import wave
+          with wave.open('/tmp/out.wav', 'rb') as w:
+              assert (w.getnchannels(), w.getframerate(), w.getnframes()) == (1, 48000, 24000), \
+                  (w.getnchannels(), w.getframerate(), w.getnframes())
+          print('anechoic_offline smoke OK')
+          PY
+
+      - name: Validate VST3 with pluginval
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Windows.zip -OutFile pluginval.zip
+          Expand-Archive pluginval.zip -DestinationPath pluginval-bin
+          $tool = Get-ChildItem -Recurse -Filter pluginval.exe pluginval-bin | Select-Object -First 1
+          $vst3 = Get-ChildItem -Recurse -Filter *.vst3 build | Select-Object -First 1
+          if (-not $tool -or -not $vst3) { throw "pluginval or VST3 binary not found" }
+          & $tool.FullName --validate $vst3.FullName
+
+      - name: Stage LADSPA install (for PipeWire)
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          mkdir -p _stage/lib/ladspa
+          cp build/bin/ladspa/libanechoic_ladspa.so _stage/lib/ladspa/
+          cp pipewire/99-anechoic-ladspa.conf _stage/lib/ladspa/
+
+      - name: Upload artifacts
+        if: ${{ runner.os != 'Linux' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.config.artifact }}
+          path: build/bin
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload artifacts (Linux, incl. staged LADSPA + PipeWire preset)
+        if: ${{ runner.os == 'Linux' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.config.artifact }}
+          path: |
+            build/bin
+            _stage/lib/ladspa
+          retention-days: 7
+          if-no-files-found: error
